@@ -41,12 +41,6 @@ chmod +x run.sh
 ```
 *未在mac/linux上实测，如有遇到问题请及时联系/提出issue*
 
-### 从 PyPI 安装（可选）
-```bash
-pipx install bili-translate-proxy
-bili-translate-proxy install      # 注册开机自启
-```
-
 ---
 
 ## 在「陪读蛙」（或任意 OpenAI 兼容客户端）里配置

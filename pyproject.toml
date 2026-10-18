@@ -16,8 +16,5 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-[project.scripts]
-bili-translate-proxy = "proxy:main"
-
 [tool.setuptools]
 py-modules = ["proxy"]
