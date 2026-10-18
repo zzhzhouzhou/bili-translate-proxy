@@ -23,7 +23,7 @@ Subcommands:
     proxy.py install               # register autostart (current user)
     proxy.py uninstall             # remove autostart
     proxy.py test                  # self-check both egress paths
-    proxy.py watchdog              # keep-alive loop (used by install)
+    proxy.py setup                 # interactive wizard (start, self-test, autostart)
 
 Stdlib only — runs on any Python 3.8+.
 """
@@ -58,7 +58,14 @@ DEBUG_LOG = os.path.join(HERE, "proxy_requests.log")
 
 
 def debug_log(msg):
+    """Append a debug line, rotating the log when it grows past ~1 MB so a
+    long-running proxy never lets the log file grow without bound on disk."""
     try:
+        try:
+            if os.path.getsize(DEBUG_LOG) > 1_000_000:
+                os.replace(DEBUG_LOG, DEBUG_LOG + ".1")
+        except FileNotFoundError:
+            pass
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(DEBUG_LOG, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
@@ -129,7 +136,9 @@ def open_with_fallback(req, timeout, openers):
     last_err = None
     last_bad = None
     for idx, op in enumerate(openers):
-        use_timeout = 10 if idx == 0 else timeout
+        # The direct path uses a shorter timeout so a dead direct connection
+        # fails fast to the proxy fallback (or to a retry) instead of stalling.
+        use_timeout = 5 if idx == 0 else timeout
         try:
             resp = op.open(req, timeout=use_timeout)
             if getattr(resp, "status", 0) // 100 == 2:
@@ -145,6 +154,58 @@ def open_with_fallback(req, timeout, openers):
     if last_bad is not None:
         return last_bad
     raise last_err if last_err else OSError("no opener available")
+
+
+# Cache openers per detected proxy so we don't rebuild handler objects on
+# every request (cheap, and keeps long-running memory flat). The cache is
+# invalidated when the detected proxy string changes (covers proxy toggles).
+_OPENERS_CACHE_KEY = None
+_OPENERS_CACHE_VAL = None
+
+
+def get_openers():
+    key = detect_system_proxy()
+    global _OPENERS_CACHE_KEY, _OPENERS_CACHE_VAL
+    if _OPENERS_CACHE_KEY != key or _OPENERS_CACHE_VAL is None:
+        _OPENERS_CACHE_VAL = build_openers()
+        _OPENERS_CACHE_KEY = key
+    return _OPENERS_CACHE_VAL
+
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _is_retryable(exc):
+    if isinstance(exc, (urllib.error.URLError, socket.timeout, ConnectionError,
+                        BrokenPipeError, TimeoutError)):
+        return True
+    if isinstance(exc, urllib.error.HTTPError) and exc.code in RETRYABLE_STATUS:
+        return True
+    # Some connection resets surface as plain OSError
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+def fetch_upstream(req, timeout):
+    """Call the upstream with direct->proxy fallback, retrying transient
+    failures (connection errors and 429/5xx) up to 3 times with backoff.
+    Retries happen before anything is sent to the client, so behavior is
+    identical on success and strictly more robust on flaky upstreams."""
+    last = None
+    for attempt in range(4):  # 1 initial + 3 retries
+        try:
+            return open_with_fallback(req, timeout, get_openers())
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < 3 and _is_retryable(e):
+                backoff = [0.3, 0.6, 1.2][attempt]
+                debug_log(f"upstream attempt {attempt + 1} failed ({e!r}); "
+                          f"retry in {backoff}s")
+                time.sleep(backoff)
+                continue
+            break
+    raise last if last else OSError("no opener available")
 
 
 # --------------------------------------------------------------------------
@@ -231,6 +292,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"error": f"bad request: {e}"}).encode("utf-8"))
             return
 
+        # Always call the upstream in STREAMING mode for /chat/completions.
+        # The free gateway returns 504 after ~10s of silence; streaming keeps
+        # data flowing and sidesteps that. Non-streaming clients get the SSE
+        # deltas assembled back into a standard response. (Mirrors the Go proxy.)
+        if path.endswith("/chat/completions"):
+            self._proxy_chat_completions(payload)
+            return
+
         if "messages" not in payload:
             if "input" in payload and isinstance(payload["input"], str):
                 payload["messages"] = [{"role": "user", "content": payload["input"]}]
@@ -269,7 +338,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         response_started = False
         try:
-            resp = open_with_fallback(req, 120, build_openers())
+            resp = fetch_upstream(req, 120)
             with resp:
                 response_started = True
                 self.close_connection = True
@@ -300,6 +369,112 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
             except OSError:
                 self.close_connection = True
+
+    def _proxy_chat_completions(self, payload):
+        """Forward /v1/chat/completions. Always requests STREAMING from the
+        upstream (avoids the free gateway's ~10s-silence 504), and either
+        passes the SSE stream through or assembles it back into a standard
+        non-streaming response depending on what the client asked for."""
+        payload["model"] = payload.get("model") or self.default_model
+        if not isinstance(payload.get("chat_template_kwargs"), dict):
+            payload["chat_template_kwargs"] = {}
+        payload["chat_template_kwargs"]["enable_thinking"] = False
+        if payload.get("temperature") is None:
+            payload["temperature"] = 0.0
+        client_wants_stream = bool(payload.get("stream"))
+        payload["stream"] = True  # force upstream streaming
+
+        body = json.dumps(payload).encode("utf-8")
+        upstream_url = f"{self.api_base.rstrip('/')}/chat/completions"
+        debug_log(f"IN chat model={payload.get('model')} stream->upstream "
+                  f"msgs={json.dumps(payload.get('messages'), ensure_ascii=False)[:300]}")
+        req = urllib.request.Request(
+            upstream_url, data=body,
+            headers={"Content-Type": "application/json", "User-Agent": "Index-Translate-Proxy/1.0"},
+            method="POST",
+        )
+
+        try:
+            resp = fetch_upstream(req, 120)
+        except Exception as e:  # noqa: BLE001
+            debug_log(f"UPSTREAM FAIL url={upstream_url!r} err={e!r}")
+            self.send_response(502)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+            return
+
+        self.close_connection = True
+        with resp:
+            if client_wants_stream:
+                # Pass SSE straight through.
+                self.send_response(resp.code)
+                self._cors()
+                ct = resp.headers.get("Content-Type", "text/event-stream")
+                self.send_header("Content-Type", ct)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                while True:
+                    chunk = resp.read1(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                return
+
+            # Non-streaming client: assemble SSE deltas into one JSON.
+            parts = []
+            meta = {}
+            while True:
+                chunk = resp.read1(8192)
+                if not chunk:
+                    break
+                for line in chunk.decode("utf-8", "replace").split("\n"):
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        continue
+                    try:
+                        obj = json.loads(data)
+                    except Exception:
+                        continue
+                    if "id" in obj and "id" not in meta:
+                        meta["id"] = obj["id"]
+                    if "model" in obj and "model" not in meta:
+                        meta["model"] = obj["model"]
+                    try:
+                        delta = obj["choices"][0]["delta"].get("content") or ""
+                    except Exception:
+                        delta = ""
+                    if delta:
+                        parts.append(delta)
+            text = "".join(parts)
+            out = {
+                "id": meta.get("id", "chatcmpl-proxy"),
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": meta.get("model", payload.get("model")),
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": None,
+            }
+            body_out = json.dumps(out).encode("utf-8")
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body_out)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body_out)
+            self.wfile.flush()
 
 
 # --------------------------------------------------------------------------
@@ -467,33 +642,6 @@ def uninstall_autostart(args):
     return 0
 
 
-def run_watchdog(args):
-    """Keep-alive: if the port is not listening, spawn 'serve'. Loops forever."""
-    py = find_python()
-    serve = [py, os.path.join(HERE, "proxy.py"), "serve",
-             "--port", str(args.port), "--host", args.host]
-    if args.model != DEFAULT_MODEL:
-        serve += ["--model", args.model]
-    print(f"Watchdog started: ensuring http://{args.host}:{args.port} is up "
-          f"(check every 30s).", flush=True)
-    while True:
-        if not port_is_listening(args.host if args.host != "0.0.0.0" else "127.0.0.1",
-                                 args.port):
-            debug_log("watchdog: port down, starting serve")
-            try:
-                # DEVNULL avoids file-lock contention on shared log files.
-                subprocess.Popen(
-                    serve,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                    if sys.platform.startswith("win") else 0,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    close_fds=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                debug_log(f"watchdog spawn failed: {e!r}")
-        time.sleep(10)
-
-
 def run_setup(args):
     """Interactive, foolproof setup wizard:
     check Python -> start proxy -> self-test -> ask autostart -> print config."""
@@ -576,7 +724,7 @@ def _python_runs(py):
 
 
 def install_autostart_launch_only(args):
-    """Launch the watchdog now (without necessarily registering autostart)."""
+    """Launch the (minimal) watchdog now without registering autostart."""
     system = sys.platform
     if system.startswith("win"):
         vbs = os.path.join(HERE, "start_hidden.vbs")
@@ -591,7 +739,7 @@ def install_autostart_launch_only(args):
             if not os.path.exists(pyw):
                 pyw = "pythonw"
             subprocess.Popen(
-                [pyw, os.path.join(HERE, "proxy.py"), "watchdog",
+                [pyw, os.path.join(HERE, "watchdog.py"),
                  "--port", str(args.port), "--host", args.host],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 close_fds=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -599,7 +747,7 @@ def install_autostart_launch_only(args):
     else:
         # Launch watchdog in background; on Linux/macOS just spawn it.
         subprocess.Popen(
-            [find_python(), os.path.join(HERE, "proxy.py"), "watchdog",
+            [find_python(), os.path.join(HERE, "watchdog.py"),
              "--port", str(args.port), "--host", args.host],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             close_fds=True, start_new_session=True,
@@ -628,7 +776,6 @@ def build_parser():
                    help="register autostart for current user (runs watchdog)")
     sub.add_parser("uninstall", help="remove autostart")
     sub.add_parser("test", parents=[common], help="self-check egress paths")
-    sub.add_parser("watchdog", parents=[common], help="keep-alive loop (internal)")
     sub.add_parser("setup", parents=[common],
                    help="interactive wizard: start proxy, self-test, ask autostart, print config")
     return ap
@@ -648,8 +795,6 @@ def main():
         install_autostart(args)
     elif cmd == "uninstall":
         sys.exit(uninstall_autostart(args))
-    elif cmd == "watchdog":
-        run_watchdog(args)
     elif cmd == "setup":
         sys.exit(run_setup(args))
 

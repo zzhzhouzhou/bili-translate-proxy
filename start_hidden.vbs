@@ -18,8 +18,7 @@ logOut = scriptDir & "\proxy.out.log"
 logErr = scriptDir & "\proxy.err.log"
 
 ' Run via cmd /c so stdout/stderr redirect to files. Window style 0 = hidden.
-cmd = "%COMSPEC% /c """"" & py & """ """ & scriptDir & "\proxy.py"" watchdog" & _
-      " > """ & logOut & """ 2> """ & logErr & """"
+cmd = "%COMSPEC% /c """"" & py & """ """ & scriptDir & "\watchdog.py"" > """ & logOut & """ 2> """ & logErr & """"
 
 WshShell.Run cmd, 0, False
 Set WshShell = Nothing
