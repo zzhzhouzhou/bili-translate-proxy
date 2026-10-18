@@ -1,0 +1,16 @@
+# Logs
+proxy_requests.log
+proxy.out.log
+proxy.err.log
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db

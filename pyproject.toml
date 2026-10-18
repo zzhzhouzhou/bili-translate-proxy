@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bili-translate-proxy"
+version = "0.1.0"
+description = "Local OpenAI-compatible proxy for Bilibili's free Index-Translate API (zero-dependency, works with/without a system proxy)."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+keywords = ["translation", "bilibili", "index-translate", "openai", "proxy", "immersive-translate"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.scripts]
+bili-translate-proxy = "proxy:main"
+
+[tool.setuptools]
+py-modules = ["proxy"]

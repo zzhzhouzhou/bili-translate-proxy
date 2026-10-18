@@ -1,0 +1,14 @@
+[Unit]
+Description=Index-Translate Local Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# proxy.py `install` rewrites this ExecStart with the resolved interpreter.
+ExecStart=python3 %h/bili-translate-proxy/proxy.py serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
