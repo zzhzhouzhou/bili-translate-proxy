@@ -116,7 +116,11 @@ class IPv4HTTPSHandler(urllib.request.HTTPSHandler):
 def build_openers():
     """Direct-first, then system proxy. Detected per call so toggling the
     local proxy on/off is picked up without a restart."""
-    openers = [urllib.request.build_opener(IPv4HTTPHandler, IPv4HTTPSHandler)]
+    # ProxyHandler({}) is essential: without it build_opener installs the
+    # DEFAULT ProxyHandler, which reads HTTPS_PROXY/HTTP_PROXY from the env and
+    # would silently route the "direct" path through a (possibly dead) proxy.
+    openers = [urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), IPv4HTTPHandler, IPv4HTTPSHandler)]
     proxy = detect_system_proxy()
     if proxy:
         try:
@@ -602,6 +606,102 @@ WantedBy=default.target
         print(f"(systemctl enable skipped: {e})")
 
 
+def _our_processes():
+    """Return [(pid, kind)] for THIS project's watchdog/serve processes only.
+
+    Matching is anchored on this script's directory so unrelated Python
+    programs are never touched (unlike a blanket taskkill of python.exe).
+    """
+    found = []
+    here = HERE.lower()
+    me = os.getpid()
+    if sys.platform.startswith("win"):
+        ps = ("Get-CimInstance Win32_Process | "
+              "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress")
+        try:
+            raw = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=60).stdout.strip()
+            items = json.loads(raw) if raw else []
+        except Exception:
+            items = []
+        if isinstance(items, dict):
+            items = [items]
+        for it in items or []:
+            try:
+                pid = int(it.get("ProcessId"))
+            except (TypeError, ValueError):
+                continue
+            cmd = (it.get("CommandLine") or "").lower()
+            if pid == me or here not in cmd:
+                continue
+            if "watchdog.py" in cmd:
+                found.append((pid, "watchdog"))
+            elif "proxy.py" in cmd and " serve" in cmd:
+                found.append((pid, "serve"))
+    else:
+        for pattern, kind in ((os.path.join(HERE, "watchdog.py"), "watchdog"),
+                              (os.path.join(HERE, "proxy.py") + " serve", "serve")):
+            try:
+                out = subprocess.run(["pgrep", "-f", pattern],
+                                     capture_output=True, text=True, timeout=10).stdout
+            except Exception:
+                continue
+            for line in out.split():
+                try:
+                    pid = int(line)
+                except ValueError:
+                    continue
+                if pid != me:
+                    found.append((pid, kind))
+    return found
+
+
+def stop_processes(quiet=False):
+    """Stop this project's watchdog first (so it does not respawn), then the
+    serve worker. Idempotent: returns the number of processes signalled."""
+    procs = _our_processes()
+    # watchdog first, then serve
+    procs.sort(key=lambda kv: 0 if kv[1] == "watchdog" else 1)
+    signalled = 0
+    for pid, kind in procs:
+        try:
+            if sys.platform.startswith("win"):
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=20)
+            else:
+                os.kill(pid, 15)  # SIGTERM
+            signalled += 1
+            if not quiet:
+                print(f"  stopped {kind} (pid {pid})")
+        except Exception as e:  # noqa: BLE001
+            if not quiet:
+                print(f"  could not stop {kind} (pid {pid}): {e!r}")
+    return signalled
+
+
+def run_stop(args):
+    """Official stop: terminate the watchdog + proxy worker of this install."""
+    if port_is_listening("127.0.0.1", args.port, timeout=0.5):
+        print(f"Proxy is running on port {args.port}; shutting it down...")
+    n = stop_processes()
+    if n:
+        print(f"Stopped {n} process(es).")
+    else:
+        print("Nothing to stop: the proxy is not running.")
+    # brief settle, then confirm the port is really free
+    for _ in range(10):
+        if not port_is_listening("127.0.0.1", args.port, timeout=0.3):
+            break
+        time.sleep(0.3)
+    if port_is_listening("127.0.0.1", args.port, timeout=0.3):
+        print(f"WARNING: port {args.port} is still in use (something else is listening).")
+        return 1
+    print(f"Port {args.port} is free.")
+    return 0
+
+
 def install_autostart(args):
     system = sys.platform
     if system.startswith("win"):
@@ -639,6 +739,7 @@ def uninstall_autostart(args):
         unit_name = "index-translate-proxy.service"
         subprocess.run(["systemctl", "--user", "disable", "--now", unit_name], check=False)
         print("Disabled systemd user service.")
+    print("Stopping the running proxy...")
     return 0
 
 
@@ -705,7 +806,10 @@ def run_setup(args):
     print(f"   API Key  : index   (any string works)")
     print("=" * 60)
     print(" Keep this window open or close it — the proxy runs in the")
-    print(" background. To stop: run stop_proxy.bat (or 'proxy.py uninstall').")
+    print(" background.")
+    print(" To STOP the proxy:  double-click stop_proxy.bat")
+    print(" To ALSO cancel autostart:  double-click uninstall.bat")
+    print(" (or run 'proxy.py stop' / 'proxy.py uninstall')")
     print()
     try:
         input("Press Enter to finish...")
@@ -774,7 +878,10 @@ def build_parser():
     sub.add_parser("serve", parents=[common], help="run the proxy (foreground)")
     sub.add_parser("install", parents=[common],
                    help="register autostart for current user (runs watchdog)")
-    sub.add_parser("uninstall", help="remove autostart")
+    sub.add_parser("stop", parents=[common],
+                   help="stop the running watchdog + proxy (official off switch)")
+    sub.add_parser("uninstall", parents=[common],
+                   help="remove autostart and stop the proxy completely")
     sub.add_parser("test", parents=[common], help="self-check egress paths")
     sub.add_parser("setup", parents=[common],
                    help="interactive wizard: start proxy, self-test, ask autostart, print config")
@@ -790,11 +897,15 @@ def main():
         run_serve(args)
     elif cmd == "test":
         sys.exit(run_test(args))
+    elif cmd == "stop":
+        sys.exit(run_stop(args))
     elif cmd == "install":
         # install registers the watchdog (which keeps serve alive) as autostart
         install_autostart(args)
     elif cmd == "uninstall":
-        sys.exit(uninstall_autostart(args))
+        rc = uninstall_autostart(args)
+        stop_processes()
+        sys.exit(rc)
     elif cmd == "setup":
         sys.exit(run_setup(args))
 

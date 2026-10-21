@@ -27,10 +27,17 @@ B 站的翻译接口要求请求里带一个隐藏参数
 ## 安装与运行
 
 ### Windows（推荐：一键安装向导）
-- **一键启动（推荐）**：双击 `setup.bat` → 弹出命令行窗口 → 自动完成全部安装 → 询问是否静默开机自启（输入 `y` 或回车即可）→ 最后窗口里打印出API 地址 / 模型 / API Key。
-- **仅静默自启**：双击 `install_autostart.bat` → 注册开机自启并立即启动，无窗口，意外退出会自动重启
+- **一键启动（推荐）**：双击 `setup.bat` → 弹出命令行窗口，直接输入一个数字即可：
+  - `1` 安装 / 启动（向导会自动启动代理、自检、询问是否开机自启，最后打印 API 地址 / 模型 / API Key）
+  - `2` 立即停止（**保留**开机自启注册，下次登录仍会自动启动）
+  - `3` 彻底关闭（**取消**开机自启 + 停止进程，之后不会再自启）
+  - `4` 退出
+- **仅静默自启**：双击 `install_autostart.bat` → 注册开机自启并立即启动，无窗口，意外退出会自动重启。
 - **控制台调试**：双击 `run_windows.bat`（可见窗口，Ctrl+C 停止）。
-- **停止**：双击 `stop_proxy.bat`。
+- **停止代理**：双击 `stop_proxy.bat`（等价于 `proxy.py stop`，保留自启注册）。
+- **彻底关闭**：双击 `uninstall.bat`（等价于 `proxy.py uninstall`，取消自启并停止进程）。
+
+> 以上"停止 / 关闭"只会结束**本项目**的进程，不会影响你电脑上其他的 Python 程序。
 
 ### macOS / Linux
 ```bash
@@ -68,9 +75,12 @@ chmod +x run.sh
 python proxy.py serve      [--port 8080] [--host 127.0.0.1] [--model ...] [--api-base ...] [--upstream-proxy ...]
 python proxy.py setup      交互式安装向导（检查 Python → 启动代理 → 自检 → 询问自启 → 打印配置）
 python proxy.py install    注册当前用户的开机自启，并启动看门狗
-python proxy.py uninstall  移除开机自启
+python proxy.py stop       停止正在运行的代理（保留开机自启注册）
+python proxy.py uninstall  取消开机自启 + 停止代理（彻底关闭）
 python proxy.py test       自检两条出口路径是否连通
 ```
+
+> `stop` / `uninstall` 只结束本项目的 watchdog 与代理进程，不会误杀其他 Python 程序。
 
 - `--port`（默认 8080）、`--host`（默认 127.0.0.1；`0.0.0.0` 暴露到局域网）
 - `--model` 默认上游模型

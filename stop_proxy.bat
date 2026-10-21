@@ -1,9 +1,15 @@
 @echo off
-REM Stop the background proxy (and its watchdog).
+REM Stop the background proxy using the official 'stop' command.
+REM This only stops THIS project's watchdog + proxy worker; other Python
+REM programs are never touched.
 SETLOCAL
-taskkill /F /FI "IMAGENAME eq python.exe" /FI "WINDOWTITLE eq *proxy.py*" >nul 2>&1
-taskkill /F /FI "IMAGENAME eq pythonw.exe" >nul 2>&1
-taskkill /F /FI "IMAGENAME eq py.exe" >nul 2>&1
-ECHO Stop signal sent. The proxy should shut down shortly.
-ENDLOCAL
+SET "DIR=%~dp0"
+SET "PY=py"
+where py >nul 2>&1 || SET "PY=python"
+
+"%PY%" "%DIR%proxy.py" stop
+ECHO.
+ECHO Done. The proxy is stopped (autostart, if any, is still registered).
+ECHO To also cancel autostart, run uninstall.bat.
 pause
+ENDLOCAL
